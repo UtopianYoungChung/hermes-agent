@@ -12,6 +12,7 @@
 import { atom, host } from '@hermes/plugin-sdk'
 
 import { $botMeta, $lastRoster, botRosterKey } from './data'
+import { recordGroupTranscriptEntry } from './group-transcript'
 import { groupMemberReferencesConnection, markOrphanedGroupMemberDescriptor } from './hygiene'
 import { getPluginCtx } from './shared'
 import type {
@@ -1453,6 +1454,10 @@ export function appendGroupChatEntry(
 
     return room
   })
+
+  // Room note taker: mirror the entry verbatim to the gateway's per-room
+  // transcript file. Fire-and-forget — the room never waits on or fails for it.
+  recordGroupTranscriptEntry(group, ($groupChats.get()[group] || {}).roomId, entry)
 
   // Needs-you: a member addressing @user badges the group header.
   if (from.kind === 'member' && /@user\b/i.test(entry.text)) {
