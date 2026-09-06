@@ -22,7 +22,7 @@ import {
 } from './group-chat'
 import type { GroupChatRoom, GroupHoldStamp } from './group-chat'
 import { durableGroupChatMembers, groupMemberKey } from './group-membership'
-import { harvestStrandedGroupReply, isGroupPassText, runGroupChatMemberTurn } from './group-turns'
+import { harvestStrandedGroupReply, isGroupPassText, resetGroupMemberSession, runGroupChatMemberTurn } from './group-turns'
 import { requestForBot } from './routing'
 import type { Attachment, GroupMember, GroupMessage } from './types'
 
@@ -271,6 +271,20 @@ export function classifyGroupHoldDirective(
 interface GroupMentionParse {
   everyone?: boolean
   mentioned?: Iterable<string>
+}
+
+/** #overflow-2026-09-06: "@member reset session" — a USER-only directive that
+ *  gives every mentioned member a fresh room session (see
+ *  resetGroupMemberSession). Needs both words and at least one direct mention;
+ *  `@everyone reset session` names nobody and does nothing, on purpose. */
+export function classifyGroupResetDirective(text: string, mentionedKeys: Iterable<string> | null | undefined): string[] {
+  const value = String(text || '')
+
+  if (!/\breset\b/i.test(value) || !/\bsession\b/i.test(value)) {
+    return []
+  }
+
+  return [...(mentionedKeys || [])]
 }
 
 /** #93129: next holds map after one user message. Holds are keyed by
@@ -1026,7 +1040,7 @@ export function sendToGroupChat(
     thread: target
   })
 
-  if (!wasRunning) {
+  const drive = () => {
     void runGroupChatRounds(group, members, target).catch(() => {
       updateGroupChat(group, (r: GroupChatRoom) => {
         r.running = false
@@ -1034,18 +1048,37 @@ export function sendToGroupChat(
         return r
       })
     })
+  }
+
+  // "@member reset session": mint the fresh session(s) BEFORE the drive so
+  // the very next turn already runs on them. A failed reset is reported in
+  // the activity feed and the drive still runs.
+  const resetKeys = classifyGroupResetDirective(trimmed, parseGroupChatMentions(trimmed, members).mentioned || [])
+  const resets = members.filter((member: GroupMember) => resetKeys.includes(groupMemberKey(member)))
+
+  const kickoff = resets.length
+    ? () => {
+        void Promise.allSettled(
+          resets.map((member: GroupMember) =>
+            resetGroupMemberSession(group, member).catch((error: any) => {
+              recordGroupActivity(group, {
+                kind: 'failed',
+                member: member.name,
+                thread: target,
+                reason: String(error?.message || error)
+              })
+            })
+          )
+        ).then(drive)
+      }
+    : drive
+
+  if (!wasRunning) {
+    kickoff()
   } else {
     // A loop is live; it bails at its next boundary. Chain the fresh loop
     // after a short settle so exactly one drive owns the room.
-    setTimeout(() => {
-      void runGroupChatRounds(group, members, target).catch(() => {
-        updateGroupChat(group, (r: GroupChatRoom) => {
-          r.running = false
-
-          return r
-        })
-      })
-    }, 250)
+    setTimeout(kickoff, 250)
   }
 
   return target

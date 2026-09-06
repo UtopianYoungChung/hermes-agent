@@ -96,7 +96,8 @@ const GROUP_ACTIVITY_LABELS: Record<GroupActivityKind, string> = {
   capped: 'turn stopped at the round/message cap',
   delivered: 'delivered a late reply',
   held: 'is held (stopped by you) — @mention it or say resume to release',
-  stopped: 'stopped the room — remaining turns are held until resumed'
+  stopped: 'stopped the room — remaining turns are held until resumed',
+  reset: 'got a fresh room session (the old one is kept, archived)'
 }
 
 export const GROUP_ACTIVITY_GLYPHS: Record<GroupActivityKind, string> = {
@@ -111,7 +112,8 @@ export const GROUP_ACTIVITY_GLYPHS: Record<GroupActivityKind, string> = {
   capped: 'debug-step-over',
   delivered: 'mail-read',
   held: 'debug-pause',
-  stopped: 'debug-stop'
+  stopped: 'debug-stop',
+  reset: 'refresh'
 }
 
 /** Text tone for an activity row: quiet for pass/cancel/settle, accent for

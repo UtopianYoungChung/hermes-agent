@@ -225,6 +225,7 @@ export type GroupActivityKind =
   | 'passed'
   | 'queued'
   | 'replied'
+  | 'reset'
   | 'settled'
   | 'stopped'
   | 'timed-out'
@@ -236,6 +237,8 @@ export interface GroupActivityEvent {
   kind: GroupActivityKind
   member?: string
   preview?: string
+  /** Why a turn failed (gateway failure text), for 'failed' rows. */
+  reason?: string
 }
 
 /**

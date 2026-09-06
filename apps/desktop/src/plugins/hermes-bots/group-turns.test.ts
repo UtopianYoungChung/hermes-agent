@@ -709,3 +709,117 @@ describe('room record', () => {
     expect('Gone' in durable).toBe(false)
   })
 })
+
+describe('retained failed turn (#overflow-2026-09-06)', () => {
+  it('reads a retained error as a failed pass at once — no deadline extension, no timeout', async () => {
+    const room = await loadRoom({
+      errorResumes: { research: { error: 'Context overflow and auto-compaction is disabled', until: 99 } },
+      turn: () => '(pass)'
+    })
+
+    const activity = await import('./group-activity')
+
+    room.chat.updateGroupChat('Grind', current => {
+      current.log = [{ at: 1, from: { kind: 'user', name: 'You' }, id: 'u1', text: '@research status?' }]
+      current.watermarks = { 'legacy::research': 0 }
+
+      return current
+    })
+
+    const started = Date.now()
+    await room.rounds.runGroupChatRounds('Grind', [{ name: 'research', title: '' }], 'legacy')
+    const kinds = activity.currentGroupActivity('Grind').map(event => event.kind)
+
+    expect(kinds).toContain('failed')
+    expect(kinds).not.toContain('timed-out')
+    const failed = activity.currentGroupActivity('Grind').find(event => event.kind === 'failed')
+    expect(String((failed as { reason?: string })?.reason || '')).toMatch(/Context overflow/)
+    // Nothing stranded: the turn ENDED, it did not time out.
+    expect(room.chat.$groupChats.get().Grind.stranded?.research).toBeUndefined()
+    // The prompt was submitted exactly once and never re-driven.
+    expect(room.gateway.calls.filter(call => call.profile === 'research')).toHaveLength(1)
+    expect(Date.now() - started).toBeLessThan(60_000)
+  })
+
+  it('harvest consumes a stranded marker whose session reports a retained error', async () => {
+    const room = await loadRoom({
+      errorResumes: { research: { error: 'Your input exceeds the context window', until: 99 } }
+    })
+
+    room.gateway.sessions.set('sid-research', {
+      messages: [],
+      profile: 'research',
+      runtime: 'rt-research',
+      stored: 'sid-research',
+      title: 'Group: Grind'
+    })
+    room.chat.updateGroupChat('Grind', current => {
+      current.sessions = { research: 'sid-research' }
+      current.stranded = { research: { before: 0, thread: 'legacy' } }
+      current.watermarks = {}
+
+      return current
+    })
+
+    await room.turns.harvestStrandedGroupReply('Grind', { name: 'research', title: '' })
+
+    expect(room.chat.$groupChats.get().Grind.stranded?.research).toBeUndefined()
+  })
+})
+
+describe('resetGroupMemberSession (#overflow-2026-09-06)', () => {
+  it('archives the old session by title, closes it, mints a fresh one, clears stranded + watermarks', async () => {
+    const room = await loadRoom()
+    const activity = await import('./group-activity')
+
+    room.gateway.sessions.set('sid-research', {
+      messages: [{ content: 'old', role: 'assistant' }],
+      profile: 'research',
+      runtime: 'rt-research',
+      stored: 'sid-research',
+      title: 'Group: Grind'
+    })
+    room.chat.updateGroupChat('Grind', current => {
+      current.log = [{ at: 1, from: { kind: 'user', name: 'You' }, id: 'u1', text: 'hi' }]
+      current.sessions = { research: 'sid-research' }
+      current.stranded = { research: { before: 1, thread: 'legacy' } }
+      current.watermarks = { 'legacy::research': 1, 'legacy::builder': 1 }
+
+      return current
+    })
+
+    const result = await room.turns.resetGroupMemberSession('Grind', { name: 'research', title: '' })
+    const grind = room.chat.$groupChats.get().Grind
+
+    expect(result.stored).toBeTruthy()
+    expect(result.stored).not.toBe('sid-research')
+    expect(grind.sessions?.research).toBe(result.stored)
+    expect(result.archived).toMatch(/^Group: Grind \(archived /)
+    expect(room.gateway.sessions.get('sid-research')?.title).toBe(result.archived)
+    expect(room.gateway.rpcFor('session.close')).toHaveLength(1)
+    expect(grind.stranded?.research).toBeUndefined()
+    expect(grind.watermarks['legacy::research']).toBeUndefined()
+    expect(grind.watermarks['legacy::builder']).toBe(1)
+    expect(activity.currentGroupActivity('Grind').map(event => event.kind)).toContain('reset')
+    // The room now resumes the FRESH session, not the archived one.
+    const handle = await room.turns.ensureGroupChatSession('Grind', { name: 'research', title: '' })
+    expect(handle.stored).toBe(result.stored)
+  })
+
+  it('still moves the pointer when the old session cannot be archived', async () => {
+    const room = await loadRoom()
+
+    room.chat.updateGroupChat('Grind', current => {
+      current.sessions = { research: 'sid-missing' } // 4007 on resume — nothing to archive
+      current.watermarks = {}
+
+      return current
+    })
+
+    const result = await room.turns.resetGroupMemberSession('Grind', { name: 'research', title: '' })
+
+    expect(result.archived).toBeNull()
+    expect(result.stored).toBeTruthy()
+    expect(room.chat.$groupChats.get().Grind.sessions?.research).toBe(result.stored)
+  })
+})

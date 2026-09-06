@@ -82,6 +82,9 @@ export interface RpcCall {
 export interface GatewayOptions {
   /** Per profile: report inflight/running on its first N `session.resume`s. */
   busyResumes?: Record<string, number>
+  /** Per profile: report a RETAINED failed turn (`inflight: { error, status: 'error' }`)
+   *  on its first `until` resumes — the gateway's shape after a turn ends in error. */
+  errorResumes?: Record<string, { error: string; until: number }>
   /** Per profile: carry `pending_approval` on its first `until` resumes. */
   approvalUntil?: Record<string, { payload: Record<string, unknown>; until: number }>
   /** Per profile: carry `pending_clarify` on its first `until` resumes. */
@@ -264,9 +267,14 @@ export function createGroupGateway(options: GatewayOptions = {}): ScriptedGatewa
 
       const clarify = options.clarifyUntil?.[session.profile]
       const approval = options.approvalUntil?.[session.profile]
+      const retained = options.errorResumes?.[session.profile]
+      const retainedError =
+        retained && seen <= retained.until
+          ? { error: retained.error, recoverable: true, status: 'error', streaming: false }
+          : null
 
       return {
-        inflight: busy,
+        inflight: retainedError || busy,
         message_count: busy ? 0 : session.messages.length,
         messages: busy || params.omit_messages ? [] : [...session.messages],
         running: false,
@@ -275,6 +283,27 @@ export function createGroupGateway(options: GatewayOptions = {}): ScriptedGatewa
         ...(clarify && seen <= clarify.until ? { pending_clarify: clarify.payload } : {}),
         ...(approval && seen <= approval.until ? { pending_approval: approval.payload } : {})
       }
+    }
+
+    if (method === 'session.title') {
+      const session = resolveSession(params.profile, params.session_id)
+
+      if (!session) {
+        throw gatewayError(`session-scoped RPC rejected: ${String(params.session_id)} not in memory`, 4001)
+      }
+
+      const title = String(params.title ?? '')
+      titleToStored.delete(`${session.profile}::${session.title}`)
+      session.title = title
+      titleToStored.set(`${session.profile}::${title}`, session.stored)
+
+      return { pending: false, title }
+    }
+
+    if (method === 'session.close') {
+      const session = resolveSession(params.profile, params.session_id)
+
+      return { closed: Boolean(session) }
     }
 
     if (method === 'image.attach_bytes' || method === 'pdf.attach' || method === 'file.attach') {

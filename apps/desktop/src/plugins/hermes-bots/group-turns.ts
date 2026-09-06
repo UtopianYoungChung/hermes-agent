@@ -8,6 +8,7 @@
 
 import { host } from '@hermes/plugin-sdk'
 
+import { clearBotAttention, noteBotAttention } from './data'
 import { recordGroupActivity } from './group-activity'
 import { $groupChats, $groupClarify, $groupNeedsYou, appendGroupChatEntry, updateGroupChat } from './group-chat'
 import type { GroupChatRoom } from './group-chat'
@@ -97,8 +98,18 @@ interface GroupPendingApproval {
 
 /** The `session.resume` fields the room engine reads off a member's hidden
  *  per-group session. */
+/** The gateway's retained failed-turn snapshot (`_fail_inflight_turn`): a
+ *  turn that ENDED in error stays in `inflight` until the next prompt so a
+ *  reconnecting client can rebuild the error bubble. It is not work. */
+interface GroupInflightSnapshot {
+  error?: string
+  recoverable?: boolean
+  status?: string
+  streaming?: boolean
+}
+
 interface GroupSessionSnapshot {
-  inflight?: boolean
+  inflight?: boolean | GroupInflightSnapshot
   message_count?: number
   messages?: GroupTurnTranscriptMessage[]
   pending_approval?: GroupPendingApproval
@@ -230,7 +241,124 @@ export async function ensureGroupChatSession(group: string, member: GroupMember)
   }
 }
 
+
+/** Give a member a FRESH room session (#overflow-2026-09-06). A room session
+ *  grows without bound (compression is off by policy on the advisory seats),
+ *  and once it passes the model window every turn fails. The old session is
+ *  KEPT: its title is renamed away from the room title so the title fallback
+ *  in ensureGroupChatSession never resumes it, then it is closed. The member's
+ *  stranded marker and watermarks are cleared so its first fresh turn sees the
+ *  last GROUP_CHAT_HISTORY_LIMIT room lines. Archive steps are best-effort;
+ *  minting the new session is not. */
+export async function resetGroupMemberSession(
+  group: string,
+  member: GroupMember
+): Promise<{ archived: null | string; stored: null | string }> {
+  const room = $groupChats.get()[group] || {}
+  const key = groupMemberKey(member)
+  const known = room.sessions?.[key]
+  const title = `Group: ${room.roomId || group}`
+  let archived: null | string = null
+
+  if (known && known !== true) {
+    try {
+      // session.title is session-scoped: bring the old session in memory first.
+      const res = (await requestForBot(member, 'session.resume', {
+        session_id: known,
+        profile: member.name,
+        omit_messages: true
+      })) as GroupSessionSnapshot
+
+      const runtime = res?.session_id || known
+      archived = `${title} (archived ${new Date().toISOString().replace(/[:.]/g, '-')})`
+      await requestForBot(member, 'session.title', {
+        session_id: runtime,
+        profile: member.name,
+        title: archived
+      })
+      await requestForBot(member, 'session.close', {
+        session_id: runtime,
+        profile: member.name
+      })
+    } catch {
+      archived = null // the old session keeps its title; the stored pointer below still moves on
+    }
+  }
+
+  const created = (await requestForBot(member, 'session.create', {
+    profile: member.name,
+    title,
+    hidden: true,
+    room_plumbing: true,
+    follow_profile_config: true
+  })) as { session_id?: string; stored_session_id?: string }
+
+  const stored = created?.stored_session_id || null
+
+  if (!stored) {
+    throw new Error(`Could not start a fresh room session for ${member?.name || 'member'}`)
+  }
+
+  updateGroupChat(group, (r: GroupChatRoom) => {
+    r.sessions = {
+      ...(r.sessions || {}),
+      [key]: stored
+    }
+    r.sessionOwners = {
+      ...(r.sessionOwners || {}),
+      [key]: groupSessionOwner(member)
+    }
+
+    if (r.stranded && Object.prototype.hasOwnProperty.call(r.stranded, key)) {
+      const next = {
+        ...r.stranded
+      }
+
+      delete next[key]
+      r.stranded = next
+    }
+
+    for (const mark of Object.keys(r.watermarks || {})) {
+      if (mark.endsWith(`::${key}`)) {
+        delete r.watermarks[mark]
+      }
+    }
+
+    return r
+  })
+  clearBotAttention(key)
+  recordGroupActivity(group, {
+    kind: 'reset',
+    member: member.name,
+    thread: null
+  })
+
+  return { archived, stored }
+}
+
 const GROUP_TURN_TIMEOUT_MS = 180000
+
+/** The failure text when a member's session reports a RETAINED failed turn
+ *  (#overflow-2026-09-06): the gateway keeps a turn that ended in error in
+ *  `inflight` until the next prompt. Reading that as "busy" held the room for
+ *  the full 20-minute hard cap after every context-overflow failure. Null
+ *  when the inflight snapshot is live work (or absent). */
+export function retainedTurnError(state: GroupSessionSnapshot | null | undefined): null | string {
+  const inflight = state?.inflight
+
+  if (!inflight || typeof inflight !== 'object') {
+    return null
+  }
+
+  const error = String(inflight.error || '').trim()
+
+  if (inflight.status === 'error' || error) {
+    return error || 'turn failed'
+  }
+
+  return null
+}
+
 // Backstop cadence only. The turn normally wakes the instant the member's
 // session emits its terminal frame (message.complete / error) via host.onEvent;
 // this poll exists for hosts without the event tap, sessions whose events
@@ -738,6 +866,25 @@ async function runGroupChatMemberTurnLeased(
       runtimeIds.add(state.session_id)
     }
 
+    // A retained failed turn is a FINISHED turn, not work in progress: read
+    // it as a failed pass right now instead of extending the deadline toward
+    // the hard cap (which is what kept rooms waiting 20 minutes on a session
+    // that had already overflowed its context window).
+    const retained = retainedTurnError(state)
+
+    if (retained) {
+      recordGroupActivity(group, {
+        kind: 'failed',
+        member: member.name,
+        thread,
+        reason: retained
+      })
+      noteBotAttention(memberKey, retained)
+      syncGroupClarify(group, member, null)
+
+      return null
+    }
+
     const messages = Array.isArray(state?.messages) ? state.messages : []
     const busy = Boolean(state?.inflight || state?.running)
     // A clarify blocking inside the member's session is a question for the
@@ -828,7 +975,9 @@ export async function harvestStrandedGroupReply(group: string, member: GroupMemb
     return // source unreachable — leave the marker for the next boundary
   }
 
-  if (state?.inflight || state?.running) {
+  // A retained failed turn is done (and dead): consume the marker so the
+  // member is eligible again instead of being excluded from every round.
+  if (!retainedTurnError(state) && (state?.inflight || state?.running)) {
     return // still grinding — keep waiting
   }
 

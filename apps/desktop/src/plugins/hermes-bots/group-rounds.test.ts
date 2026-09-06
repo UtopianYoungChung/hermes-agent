@@ -855,3 +855,53 @@ describe('stopGroupThread (#91868/#94569)', () => {
     expect(reply).toBe('finished anyway')
   })
 })
+
+describe('reset directive (#overflow-2026-09-06)', () => {
+  it('classifies "@member reset session" and ignores @everyone or a bare "reset"', async () => {
+    const room = await loadRoom()
+
+    expect(room.rounds.classifyGroupResetDirective('@research reset session', ['research'])).toEqual(['research'])
+    expect(room.rounds.classifyGroupResetDirective('please reset the session for @research', ['research'])).toEqual([
+      'research'
+    ])
+    expect(room.rounds.classifyGroupResetDirective('@everyone reset session', [])).toEqual([])
+    expect(room.rounds.classifyGroupResetDirective('@research reset', ['research'])).toEqual([])
+    expect(room.rounds.classifyGroupResetDirective('@research session?', ['research'])).toEqual([])
+  })
+
+  it('"@research reset session" mints a fresh session and drives the turn on it', async () => {
+    const room = await loadRoom({ turn: () => 'Present, fresh.' })
+    const activity = await import('./group-activity')
+
+    room.gateway.sessions.set('sid-research', {
+      messages: [{ content: 'old', role: 'assistant' }],
+      profile: 'research',
+      runtime: 'rt-research',
+      stored: 'sid-research',
+      title: 'Group: Grind'
+    })
+    room.chat.updateGroupChat('Grind', current => {
+      current.log = []
+      current.sessions = { research: 'sid-research' }
+      current.stranded = { research: { before: 1, thread: 'legacy' } }
+      current.watermarks = {}
+
+      return current
+    })
+
+    room.rounds.sendToGroupChat('Grind', [{ name: 'research', title: '' }], '@research reset session')
+    await drain(() => Boolean(room.chat.$groupChats.get().Grind?.running))
+
+    const grind = room.chat.$groupChats.get().Grind
+    expect(grind.sessions?.research).toBeTruthy()
+    expect(grind.sessions?.research).not.toBe('sid-research')
+    expect(grind.stranded?.research).toBeUndefined()
+    expect(room.gateway.rpcFor('session.title').at(-1)?.params.title).toMatch(/archived/)
+    expect(activity.currentGroupActivity('Grind').map(event => event.kind)).toContain('reset')
+    // The turn ran on the fresh session and its reply landed.
+    const submitted = room.gateway.calls.filter(call => call.profile === 'research')
+    expect(submitted).toHaveLength(1)
+    expect(submitted[0].stored).toBe(grind.sessions?.research)
+    expect(grind.log.some(entry => entry.from.kind === 'member' && entry.text === 'Present, fresh.')).toBe(true)
+  })
+})
